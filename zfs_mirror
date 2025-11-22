@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+Simple ZFS mirror helper for data/media.
+
+Behavior:
+- Takes a recursive snapshot of data/media with prefix "sync-<timestamp>".
+- For each remote target:
+    * Resume any pending receive (if a receive_resume_token exists).
+    * Determine the latest remote snapshot with the same prefix.
+    * Send an incremental (-I base new) with -R; if no base, send full (-R new).
+- Logs to /var/log/zfs_mirror.log (falls back to stdout if not writable).
+
+Requires passwordless SSH from the user running this script to each remote.
+"""
+
+import datetime
+import logging
+import os
+import shlex
+import subprocess
+import sys
+from typing import Iterable, List, Optional, Tuple
+
+DATASET = "data/media"
+SNAP_PREFIX = "sync"
+LOG_FILE = os.environ.get("LOG_FILE", "/var/log/zfs_mirror.log")
+
+# Define remote targets as (host, port, user, remote_dataset)
+REMOTE_TARGETS: List[Tuple[str, int, str, str]] = [
+    ("evelyn.sytes.net", 10122, "root", "data/media"),
+    # ("192.168.1.119", 22, "root", "data"),  # example additional target
+]
+
+
+def configure_logging() -> None:
+    handlers = []
+    try:
+        handlers.append(logging.FileHandler(LOG_FILE))
+    except OSError:
+        handlers.append(logging.StreamHandler(sys.stdout))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
+    )
+
+
+def run(
+    cmd: List[str],
+    *,
+    check: bool = True,
+    capture_output: bool = True,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    logging.debug("Running: %s", " ".join(shlex.quote(c) for c in cmd))
+    return subprocess.run(
+        cmd,
+        check=check,
+        capture_output=capture_output,
+        text=text,
+    )
+
+
+def latest_local_snapshot() -> Optional[str]:
+    cp = run(
+        ["zfs", "list", "-H", "-t", "snapshot", "-o", "name", "-r", DATASET]
+    )
+    snaps = [
+        line.strip()
+        for line in cp.stdout.splitlines()
+        if f"@{SNAP_PREFIX}-" in line
+    ]
+    return snaps[-1] if snaps else None
+
+
+def create_snapshot() -> str:
+    snap_name = f"{DATASET}@{SNAP_PREFIX}-{datetime.datetime.now():%Y%m%d-%H%M%S}"
+    logging.info("Creating snapshot %s", snap_name)
+    run(["zfs", "snapshot", "-r", snap_name], capture_output=False)
+    return snap_name
+
+
+def ssh_cmd(host: str, port: int, user: str, remote_cmd: Iterable[str]) -> List[str]:
+    return ["ssh", "-p", str(port), "-o", "BatchMode=yes", f"{user}@{host}", *remote_cmd]
+
+
+def latest_remote_snapshot(host: str, port: int, user: str, rds: str) -> Optional[str]:
+    cmd = ssh_cmd(
+        host, port, user, ["zfs", "list", "-H", "-t", "snapshot", "-o", "name", "-r", rds]
+    )
+    try:
+        cp = run(cmd)
+    except subprocess.CalledProcessError:
+        return None
+    snaps = [
+        line.strip()
+        for line in cp.stdout.splitlines()
+        if f"@{SNAP_PREFIX}-" in line
+    ]
+    return snaps[-1] if snaps else None
+
+
+def remote_resume_token(host: str, port: int, user: str, rds: str) -> Optional[str]:
+    cmd = ssh_cmd(host, port, user, ["zfs", "get", "-H", "-o", "value", "receive_resume_token", rds])
+    try:
+        cp = run(cmd)
+    except subprocess.CalledProcessError:
+        return None
+    token = cp.stdout.strip()
+    return token if token and token != "-" else None
+
+
+def pipe_commands(send_cmd: List[str], recv_cmd: List[str]) -> None:
+    logging.debug("Send: %s", " ".join(shlex.quote(c) for c in send_cmd))
+    logging.debug("Recv: %s", " ".join(shlex.quote(c) for c in recv_cmd))
+    with subprocess.Popen(send_cmd, stdout=subprocess.PIPE) as sender:
+        with subprocess.Popen(recv_cmd, stdin=sender.stdout) as receiver:
+            sender.stdout.close()  # allow sender to receive SIGPIPE if receiver exits
+            send_rc = sender.wait()
+            recv_rc = receiver.wait()
+            if send_rc != 0:
+                raise subprocess.CalledProcessError(send_rc, send_cmd)
+            if recv_rc != 0:
+                raise subprocess.CalledProcessError(recv_rc, recv_cmd)
+
+
+def resume_if_needed(host: str, port: int, user: str, rds: str) -> None:
+    token = remote_resume_token(host, port, user, rds)
+    if not token:
+        return
+    logging.info("Resuming interrupted receive on %s:%s for %s", host, port, rds)
+    send_cmd = ["zfs", "send", "-v", "-t", token]
+    recv_cmd = ssh_cmd(host, port, user, ["zfs", "recv", "-vFsu", rds])
+    pipe_commands(send_cmd, recv_cmd)
+    logging.info("Resume complete for %s:%s %s", host, port, rds)
+
+
+def send_snapshot(snap: str, host: str, port: int, user: str, rds: str) -> None:
+    base = latest_remote_snapshot(host, port, user, rds)
+    if base:
+        logging.info("Sending incremental %s -> %s to %s:%s (%s)", base, snap, host, port, rds)
+        send_cmd = ["zfs", "send", "-vR", "-I", base, snap]
+    else:
+        logging.info("Sending full %s to %s:%s (%s)", snap, host, port, rds)
+        send_cmd = ["zfs", "send", "-vR", snap]
+    recv_cmd = ssh_cmd(host, port, user, ["zfs", "recv", "-vFsu", rds])
+    pipe_commands(send_cmd, recv_cmd)
+    logging.info("Replication to %s:%s %s complete", host, port, rds)
+
+
+def main() -> int:
+    configure_logging()
+    logging.info("=== zfs_mirror start: source=%s prefix=%s ===", DATASET, SNAP_PREFIX)
+
+    snap = create_snapshot()
+    for host, port, user, rds in REMOTE_TARGETS:
+        logging.info("--- Target: %s@%s:%s -> %s ---", user, host, port, rds)
+        try:
+            resume_if_needed(host, port, user, rds)
+            send_snapshot(snap, host, port, user, rds)
+        except subprocess.CalledProcessError as exc:
+            logging.error("Replication failed for %s@%s:%s -> %s: %s", user, host, port, rds, exc)
+            return 1
+
+    logging.info("=== zfs_mirror done: %s ===", snap)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
