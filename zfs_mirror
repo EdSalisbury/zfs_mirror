@@ -9,6 +9,7 @@ Behavior:
     * Determine the latest remote snapshot with the same prefix.
     * Send an incremental (-I base new) with -R; if no base, send full (-R new).
 - Logs to /var/log/zfs_mirror.log (falls back to stdout if not writable).
+- Remote ZFS binary path can be set per target (zfs_cmd).
 
 Requires passwordless SSH from the user running this script to each remote.
 """
@@ -19,16 +20,22 @@ import os
 import shlex
 import subprocess
 import sys
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional
 
 DATASET = "data/media"
 SNAP_PREFIX = "sync"
 LOG_FILE = os.environ.get("LOG_FILE", "/var/log/zfs_mirror.log")
 
-# Define remote targets as (host, port, user, remote_dataset)
-REMOTE_TARGETS: List[Tuple[str, int, str, str]] = [
-    ("evelyn.sytes.net", 10122, "root", "data/media"),
-    # ("192.168.1.119", 22, "root", "data"),  # example additional target
+# Define remote targets. Customize per host; zfs_cmd defaults to "zfs" if omitted.
+REMOTE_TARGETS: List[dict] = [
+    {
+        "host": "a.b.c.d",
+        "port": 10122,
+        "user": "root",
+        "dataset": "data/media",
+        "zfs_cmd": "/usr/local/zfs/bin/zfs",  # remote zfs path
+    },
+    # {"host": "192.168.1.119", "port": 22, "user": "root", "dataset": "data"},
 ]
 
 
@@ -84,9 +91,17 @@ def ssh_cmd(host: str, port: int, user: str, remote_cmd: Iterable[str]) -> List[
     return ["ssh", "-p", str(port), "-o", "BatchMode=yes", f"{user}@{host}", *remote_cmd]
 
 
-def latest_remote_snapshot(host: str, port: int, user: str, rds: str) -> Optional[str]:
+def remote_zfs_cmd(target: dict, *args: str) -> List[str]:
+    cmd = target.get("zfs_cmd", "zfs")
+    return [cmd, *args]
+
+
+def latest_remote_snapshot(target: dict) -> Optional[str]:
     cmd = ssh_cmd(
-        host, port, user, ["zfs", "list", "-H", "-t", "snapshot", "-o", "name", "-r", rds]
+        target["host"],
+        target["port"],
+        target["user"],
+        remote_zfs_cmd(target, "list", "-H", "-t", "snapshot", "-o", "name", "-r", target["dataset"]),
     )
     try:
         cp = run(cmd)
@@ -100,8 +115,13 @@ def latest_remote_snapshot(host: str, port: int, user: str, rds: str) -> Optiona
     return snaps[-1] if snaps else None
 
 
-def remote_resume_token(host: str, port: int, user: str, rds: str) -> Optional[str]:
-    cmd = ssh_cmd(host, port, user, ["zfs", "get", "-H", "-o", "value", "receive_resume_token", rds])
+def remote_resume_token(target: dict) -> Optional[str]:
+    cmd = ssh_cmd(
+        target["host"],
+        target["port"],
+        target["user"],
+        remote_zfs_cmd(target, "get", "-H", "-o", "value", "receive_resume_token", target["dataset"]),
+    )
     try:
         cp = run(cmd)
     except subprocess.CalledProcessError:
@@ -124,28 +144,51 @@ def pipe_commands(send_cmd: List[str], recv_cmd: List[str]) -> None:
                 raise subprocess.CalledProcessError(recv_rc, recv_cmd)
 
 
-def resume_if_needed(host: str, port: int, user: str, rds: str) -> None:
-    token = remote_resume_token(host, port, user, rds)
+def resume_if_needed(target: dict) -> None:
+    token = remote_resume_token(target)
     if not token:
         return
-    logging.info("Resuming interrupted receive on %s:%s for %s", host, port, rds)
+    logging.info("Resuming interrupted receive on %s:%s for %s", target["host"], target["port"], target["dataset"])
     send_cmd = ["zfs", "send", "-v", "-t", token]
-    recv_cmd = ssh_cmd(host, port, user, ["zfs", "recv", "-vFsu", rds])
+    recv_cmd = ssh_cmd(
+        target["host"],
+        target["port"],
+        target["user"],
+        remote_zfs_cmd(target, "recv", "-vFsu", target["dataset"]),
+    )
     pipe_commands(send_cmd, recv_cmd)
-    logging.info("Resume complete for %s:%s %s", host, port, rds)
+    logging.info("Resume complete for %s:%s %s", target["host"], target["port"], target["dataset"])
 
 
-def send_snapshot(snap: str, host: str, port: int, user: str, rds: str) -> None:
-    base = latest_remote_snapshot(host, port, user, rds)
+def send_snapshot(snap: str, target: dict) -> None:
+    base = latest_remote_snapshot(target)
     if base:
-        logging.info("Sending incremental %s -> %s to %s:%s (%s)", base, snap, host, port, rds)
+        logging.info(
+            "Sending incremental %s -> %s to %s:%s (%s)",
+            base,
+            snap,
+            target["host"],
+            target["port"],
+            target["dataset"],
+        )
         send_cmd = ["zfs", "send", "-vR", "-I", base, snap]
     else:
-        logging.info("Sending full %s to %s:%s (%s)", snap, host, port, rds)
+        logging.info(
+            "Sending full %s to %s:%s (%s)",
+            snap,
+            target["host"],
+            target["port"],
+            target["dataset"],
+        )
         send_cmd = ["zfs", "send", "-vR", snap]
-    recv_cmd = ssh_cmd(host, port, user, ["zfs", "recv", "-vFsu", rds])
+    recv_cmd = ssh_cmd(
+        target["host"],
+        target["port"],
+        target["user"],
+        remote_zfs_cmd(target, "recv", "-vFsu", target["dataset"]),
+    )
     pipe_commands(send_cmd, recv_cmd)
-    logging.info("Replication to %s:%s %s complete", host, port, rds)
+    logging.info("Replication to %s:%s %s complete", target["host"], target["port"], target["dataset"])
 
 
 def main() -> int:
@@ -153,13 +196,27 @@ def main() -> int:
     logging.info("=== zfs_mirror start: source=%s prefix=%s ===", DATASET, SNAP_PREFIX)
 
     snap = create_snapshot()
-    for host, port, user, rds in REMOTE_TARGETS:
-        logging.info("--- Target: %s@%s:%s -> %s ---", user, host, port, rds)
+    for target in REMOTE_TARGETS:
+        logging.info(
+            "--- Target: %s@%s:%s -> %s (zfs=%s) ---",
+            target["user"],
+            target["host"],
+            target["port"],
+            target["dataset"],
+            target.get("zfs_cmd", "zfs"),
+        )
         try:
-            resume_if_needed(host, port, user, rds)
-            send_snapshot(snap, host, port, user, rds)
+            resume_if_needed(target)
+            send_snapshot(snap, target)
         except subprocess.CalledProcessError as exc:
-            logging.error("Replication failed for %s@%s:%s -> %s: %s", user, host, port, rds, exc)
+            logging.error(
+                "Replication failed for %s@%s:%s -> %s: %s",
+                target["user"],
+                target["host"],
+                target["port"],
+                target["dataset"],
+                exc,
+            )
             return 1
 
     logging.info("=== zfs_mirror done: %s ===", snap)
