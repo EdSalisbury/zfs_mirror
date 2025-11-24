@@ -16,28 +16,21 @@ Requires passwordless SSH from the user running this script to each remote.
 
 import argparse
 import datetime
+import json
 import logging
 import os
+from pathlib import Path
 import shlex
 import subprocess
 import sys
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Dict, Any
 
 DATASET = "data/media"
 SNAP_PREFIX = "sync"
 DEFAULT_LOG_FILE = os.environ.get("LOG_FILE", "/var/log/zfs_mirror.log")
-
-# Define remote targets. Customize per host; zfs_cmd defaults to "zfs" if omitted.
-REMOTE_TARGETS: List[dict] = [
-    {
-        "host": "a.b.c.d",
-        "port": 10122,
-        "user": "root",
-        "dataset": "data/media",
-        "zfs_cmd": "/usr/local/zfs/bin/zfs",  # remote zfs path
-    },
-    # {"host": "192.168.1.119", "port": 22, "user": "root", "dataset": "data"},
-]
+DEFAULT_CONFIG_PATH = os.environ.get(
+    "TARGETS_CONFIG", str(Path(__file__).with_name("targets.json"))
+)
 
 
 def configure_logging(log_file: str, also_stdout: bool) -> None:
@@ -85,6 +78,56 @@ def redirect_stdio_to_log(log_file: str) -> None:
     except OSError:
         # If redirection fails, continue without redirect.
         pass
+
+
+def log_proc_error(exc: subprocess.CalledProcessError, context: str) -> None:
+    stdout = exc.stdout.strip() if isinstance(exc.stdout, str) else exc.stdout
+    stderr = exc.stderr.strip() if isinstance(exc.stderr, str) else exc.stderr
+    logging.error("%s: command failed (%s)", context, exc)
+    if stdout:
+        logging.error("%s: stdout: %s", context, stdout)
+    if stderr:
+        logging.error("%s: stderr: %s", context, stderr)
+
+
+def load_targets(config_path: str) -> List[Dict[str, Any]]:
+    path = Path(config_path)
+    if not path.exists():
+        logging.error("Config file not found: %s", config_path)
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:  # broad: JSON parse errors
+        logging.error("Failed to parse config %s: %s", config_path, exc)
+        return []
+
+    if not isinstance(data, list):
+        logging.error("Config %s must be a JSON array of targets", config_path)
+        return []
+
+    targets: List[Dict[str, Any]] = []
+    for idx, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            logging.error("Config entry %s is not an object", idx)
+            continue
+        missing = [k for k in ("host", "port", "user", "dataset") if k not in entry]
+        if missing:
+            logging.error("Config entry %s missing keys: %s", idx, ", ".join(missing))
+            continue
+        try:
+            target = {
+                "host": str(entry["host"]),
+                "port": int(entry["port"]),
+                "user": str(entry["user"]),
+                "dataset": str(entry["dataset"]),
+                "zfs_cmd": str(entry.get("zfs_cmd", "zfs")),
+            }
+        except Exception as exc:
+            logging.error("Config entry %s invalid: %s", idx, exc)
+            continue
+        targets.append(target)
+
+    return targets
 
 
 def latest_local_snapshot() -> Optional[str]:
@@ -214,6 +257,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="ZFS mirror helper for data/media.")
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="Log file path")
     parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help="Path to JSON targets config (default: ./targets.json or TARGETS_CONFIG env)",
+    )
+    parser.add_argument(
         "--stdout",
         action="store_true",
         help="Also log to stdout (do not redirect stdio exclusively to file)",
@@ -231,8 +279,13 @@ def main() -> int:
     configure_logging(args.log_file, also_stdout=args.stdout)
     logging.info("=== zfs_mirror start: source=%s prefix=%s ===", DATASET, SNAP_PREFIX)
 
+    targets = load_targets(args.config)
+    if not targets:
+        logging.error("No valid targets loaded; aborting.")
+        return 1
+
     snap = create_snapshot()
-    for target in REMOTE_TARGETS:
+    for target in targets:
         logging.info(
             "--- Target: %s@%s:%s -> %s (zfs=%s) ---",
             target["user"],
@@ -245,13 +298,9 @@ def main() -> int:
             resume_if_needed(target)
             send_snapshot(snap, target)
         except subprocess.CalledProcessError as exc:
-            logging.error(
-                "Replication failed for %s@%s:%s -> %s: %s",
-                target["user"],
-                target["host"],
-                target["port"],
-                target["dataset"],
+            log_proc_error(
                 exc,
+                f"Replication failed for {target['user']}@{target['host']}:{target['port']} -> {target['dataset']}",
             )
             return 1
 

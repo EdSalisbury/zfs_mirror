@@ -1,0 +1,9 @@
+[
+  {
+    "host": "1.2.3.4",
+    "port": 10122,
+    "user": "root",
+    "dataset": "data/media",
+    "zfs_cmd": "/usr/local/zfs/bin/zfs"
+  }
+]
