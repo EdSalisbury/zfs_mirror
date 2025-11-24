@@ -8,12 +8,13 @@ Behavior:
     * Resume any pending receive (if a receive_resume_token exists).
     * Determine the latest remote snapshot with the same prefix.
     * Send an incremental (-I base new) with -R; if no base, send full (-R new).
-- Logs to /var/log/zfs_mirror.log (falls back to stdout if not writable).
+- Logs to /var/log/zfs_mirror.log; by default stdout/stderr are redirected there so cron/background runs stay quiet. Use --stdout to also echo to console.
 - Remote ZFS binary path can be set per target (zfs_cmd).
 
 Requires passwordless SSH from the user running this script to each remote.
 """
 
+import argparse
 import datetime
 import logging
 import os
@@ -24,7 +25,7 @@ from typing import Iterable, List, Optional
 
 DATASET = "data/media"
 SNAP_PREFIX = "sync"
-LOG_FILE = os.environ.get("LOG_FILE", "/var/log/zfs_mirror.log")
+DEFAULT_LOG_FILE = os.environ.get("LOG_FILE", "/var/log/zfs_mirror.log")
 
 # Define remote targets. Customize per host; zfs_cmd defaults to "zfs" if omitted.
 REMOTE_TARGETS: List[dict] = [
@@ -39,11 +40,14 @@ REMOTE_TARGETS: List[dict] = [
 ]
 
 
-def configure_logging() -> None:
+def configure_logging(log_file: str, also_stdout: bool) -> None:
     handlers = []
     try:
-        handlers.append(logging.FileHandler(LOG_FILE))
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+        handlers.append(logging.FileHandler(log_file))
     except OSError:
+        handlers.append(logging.StreamHandler(sys.stdout))
+    if also_stdout:
         handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(
         level=logging.INFO,
@@ -66,6 +70,21 @@ def run(
         capture_output=capture_output,
         text=text,
     )
+
+
+def redirect_stdio_to_log(log_file: str) -> None:
+    """
+    Redirect stdout/stderr of this process (and children) to log_file.
+    Keeps line buffering for readability.
+    """
+    try:
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+        log_fh = open(log_file, "a", buffering=1)
+        os.dup2(log_fh.fileno(), sys.stdout.fileno())
+        os.dup2(log_fh.fileno(), sys.stderr.fileno())
+    except OSError:
+        # If redirection fails, continue without redirect.
+        pass
 
 
 def latest_local_snapshot() -> Optional[str]:
@@ -192,7 +211,24 @@ def send_snapshot(snap: str, target: dict) -> None:
 
 
 def main() -> int:
-    configure_logging()
+    parser = argparse.ArgumentParser(description="ZFS mirror helper for data/media.")
+    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="Log file path")
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Also log to stdout (do not redirect stdio exclusively to file)",
+    )
+    parser.add_argument(
+        "--no-redirect-stdio",
+        action="store_true",
+        help="Do not redirect stdout/stderr to log file (useful for interactive runs)",
+    )
+    args = parser.parse_args()
+
+    if not args.stdout and not args.no_redirect_stdio:
+        redirect_stdio_to_log(args.log_file)
+
+    configure_logging(args.log_file, also_stdout=args.stdout)
     logging.info("=== zfs_mirror start: source=%s prefix=%s ===", DATASET, SNAP_PREFIX)
 
     snap = create_snapshot()
