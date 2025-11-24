@@ -21,6 +21,7 @@ import logging
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 from typing import Iterable, List, Optional, Dict, Any
@@ -88,6 +89,45 @@ def log_proc_error(exc: subprocess.CalledProcessError, context: str) -> None:
         logging.error("%s: stdout: %s", context, stdout)
     if stderr:
         logging.error("%s: stderr: %s", context, stderr)
+
+
+def ignore_interactive_signals() -> None:
+    """
+    Ignore job-control/HUP signals so terminals cannot stop the pipeline.
+    """
+    for sig in (signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU, signal.SIGHUP):
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except Exception:
+            pass
+
+
+def daemonize_once() -> None:
+    """
+    Double-fork to detach from the controlling terminal.
+    Parent exits with 0; child continues in the background.
+    """
+    if os.environ.get("ZFS_MIRROR_DAEMONIZED") == "1":
+        return
+    try:
+        pid = os.fork()
+        if pid > 0:
+            os._exit(0)
+    except AttributeError:
+        return  # not supported (non-POSIX)
+    os.setsid()
+    try:
+        pid = os.fork()
+        if pid > 0:
+            os._exit(0)
+    except OSError:
+        pass
+    os.environ["ZFS_MIRROR_DAEMONIZED"] = "1"
+    try:
+        with open(os.devnull, "rb") as devnull:
+            os.dup2(devnull.fileno(), sys.stdin.fileno())
+    except Exception:
+        pass
 
 
 def load_targets(config_path: str) -> List[Dict[str, Any]]:
@@ -257,6 +297,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="ZFS mirror helper for data/media.")
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="Log file path")
     parser.add_argument(
+        "--detach",
+        dest="detach",
+        action="store_true",
+        default=True,
+        help="Run in background (default). Use --foreground to stay attached.",
+    )
+    parser.add_argument(
+        "--foreground",
+        dest="detach",
+        action="store_false",
+        help="Run in foreground (no daemonize).",
+    )
+    parser.add_argument(
         "--config",
         default=DEFAULT_CONFIG_PATH,
         help="Path to JSON targets config (default: ./targets.json or TARGETS_CONFIG env)",
@@ -273,9 +326,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.detach:
+        daemonize_once()
+
     if not args.stdout and not args.no_redirect_stdio:
         redirect_stdio_to_log(args.log_file)
 
+    ignore_interactive_signals()
     configure_logging(args.log_file, also_stdout=args.stdout)
     logging.info("=== zfs_mirror start: source=%s prefix=%s ===", DATASET, SNAP_PREFIX)
 
